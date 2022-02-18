@@ -1,5 +1,22 @@
 #!/bin/bash
 
+# This is a fork of sitaramc/bq (currently at https://github.com/sitaramc/notes)
+# Slightly modded to always use "mc" instead of "vifm", as well as adding
+# a few things to better suit my personal workflow:
+#	Mainly:
+#		-g		Report nubmer of current workers
+#		-ka		Stop all current workers
+#		-w -n n		Set number of workers to 'n'
+#		-j		Report number of jobs left in queue
+#
+#	These are all -q compatible
+#       With this fork it is also possible to generate a queue with jobs
+#       from another queue.
+#
+# See help below for reference.
+
+# ----------------------------------------------------------------------
+
 # simple task queue; output files are in /dev/shm/bq-$USER.  Uses no locks;
 # use 'mv' command, which is atomic (within the same file system anyway) to
 # prevent contention.
@@ -20,14 +37,28 @@ die() { echo "$@" >&2; exit 1; }
 
 [ "$1" = "-h" ] && {
     cat <<-EOF
+_-:*'BQ'*:-_ Forked by akeda: https://github.com/akeda2/bq.git
 	Example usage:
-	    # start a worker
-	    bq -w
-	    # submit a job
-	    bq some-command arg1 arg2 [...]
-	    # check status
-	    bq                              # uses vifm as the file manager
-	    export BQ_FILEMANAGER=mc; bq    # env var overrides default
+	   Start a worker
+	      bq -w
+           Start a worker in another queue
+              bq -q queue -w
+           Start n workers
+              bq (-q queue) -w -n n
+           Report amount of current workers in queue
+              bq (-q queue) -g
+           Stop a worker process
+              bq -k
+           Stop all workers
+              bq -ka
+           Stop all workers in a queue
+              bq -q queue -ka
+            
+	   Submit a job
+	      bq some-command arg1 arg2 [...]
+	   Check status
+	      bq                              # uses mc as the file manager
+	    # export BQ_FILEMANAGER=mc; bq    # env var overrides default
 	    # you can only run one simple command; if you have a command with
 	    # shell meta characters (;, &, &&, ||, >, <, etc), do this:
 	    bq bash -c 'echo hello; echo there >junk.\$RANDOM'
@@ -38,19 +69,49 @@ die() { echo "$@" >&2; exit 1; }
 # ----------------------------------------------------------------------
 # SETUP
 
-TMP=/dev/shm
+# Look for directory (in my case, a symlink to /dev/shm)
+if [ -d "/bq" ]; then
+	TMP="/bq"
+else
+	TMP=/dev/shm
+fi
+# If above gives nothing, use /tmp instead
 [ -d $TMP ] || TMP=/tmp
 
 # I doubt I will ever use multiple Qs, but it's easy enough to implement
 Q=default
-[ "$1" = "-q" ] && {
-    [ -z "$2" ] && die "-q needs a queue name"
-    Q=$2; shift; shift
-}
+if [ "$1" = "-q" ]; then
+	if [ -z "$2" ]; then
+		die "-q needs a queue name"
+	fi
+	if [[ "$2" == -* ]]; then
+		die "-q name cannot start with a -"
+	fi
+	Q=$2; shift; shift
+#	echo "Q = $Q"
+	export QDIR=$TMP/bq-$USER-$Q
+fi
+
+# Checking exported env variable. This would be set by -q, if -q is set.
 [ -z "$QDIR" ] && export QDIR=$TMP/bq-$USER-$Q
+
+chmod 0750 $QDIR
 mkdir -p $QDIR/w
 mkdir -p $QDIR/q
 mkdir -p $QDIR/OK
+#echo "QDIR = $QDIR"
+# CLEANUP OLD WORKER FILES
+for pros in $QDIR/w/*; do
+	if [ -f "$pros" ]; then
+		bname="${pros##*/}"
+        	woext="${bname%.*}"
+        	ext="${bname##*.}"
+		if [ $ext != "exited" ] && [ $((ps "$woext") | wc -l) -lt 2 ]; then
+			echo "Found orphan worker: $pros"
+			rm "$pros"
+		fi
+	fi
+done
 
 # ----------------------------------------------------------------------
 # WORK 1 TASK
@@ -90,31 +151,80 @@ _work_1() {
         mv $ID.running.$$ $ID.exitcode=$ec
         [ "$ec" = "0" ] && mv $ID.* OK
         echo " # $ec" >> w/$$
-        if command -v notify-send &> /dev/null; then
-            notify-send "`wc -l w/$$`" "`tail -1 w/$$`"
-        fi
+
+# Commented out for quiet operation
+#	if command -v notify-send &> /dev/null; then
+#       	notify-send "`wc -l w/$$`" "`tail -1 w/$$`"
+#	fi
     fi
 }
 
 # ----------------------------------------------------------------------
 # START AND DAEMONISE A WORKER
 
+# How many workers are active?
+how_many_w (){
+    echo `cd $QDIR/w; ls | grep -v exited | wc -l`
+}
+# How manuy jobs are left in queue?
+how_many_j (){
+    echo `cd $QDIR/q; ls | wc -l`
+}
+
 # '-w' starts a worker; each worker runs one job at a time, so if you want
 # more jobs to run simultaneously, run this multiple times!
 [ "$1" = "-w" ] && [ -z "$2" ] && {
-
+		
     # if the user is starting a worker, any existing kill commands don't apply
     rm -f $QDIR/q/0.*.-k
 
     # daemonize
-    nohup "$0" -w $QDIR &
+	if [[ $Q != default ]]; then
+#		echo "Not default! $Q"
+		nohup "$0" -q "$Q" -w $QDIR >> $QDIR/nohup.out &
+	else
+#		echo "Default! $Q"
+    		nohup "$0" -w $QDIR >> $QDIR/nohup.out &
+	fi
 
-    # remind the user how many workers he has started, in case he forgot
+    # remind the user how many workers we have started, in case we forgot
     sleep 0.5   # wait for the other task to kick off
     echo `cd $QDIR/w; ls | grep -v exited | wc -l` workers running
     exit 0
 }
 
+#Start several workers
+
+#If -n $3 is not specified, we count the cpu-cores
+if [ "$1" == "-w" ] && [ "$2" == "-n" ]; then
+	if [ -z "$3" ]; then
+		n="$(nproc)"
+		echo "n cpus = $n"
+	else
+		n="$3"
+	fi
+
+	ti=$(how_many_w)
+
+    	while [ $ti -lt $n ]; do
+		rm -f $QDIR/q/0.*.-k
+		nohup "$0" -w $QDIR > $QDIR/nohup.out_$ti &
+		sleep 2   # wait for the other task to kick off
+		ti=$(how_many_w)
+    	done
+    	exit 0
+fi
+
+[ "$1" = "-g" ] && [ -z "$2" ] && {
+    # remind the user how many workers we have started, in case we forgot
+    echo $(how_many_w)
+    exit 0
+}
+[ "$1" == "-j" ] && [ -z "$2" ] && {
+    # How many jobs are left in queue?
+    echo $(how_many_j)
+    exit 0
+}
 # ----------------------------------------------------------------------
 # STOP A WORKER
 
@@ -123,6 +233,18 @@ _work_1() {
     # starting with a "0" assures that in an "ls" this file will come before
     # any normal task files (which all start with `date +%s`).  The contents
     # don't matter, since it won't be "executed" in the normal manner.
+    exit 0
+}
+
+# STOP ALL WORKERS
+
+[ "$1" = "-ka" ] && [ -z "$2" ] && {
+    ta=$(how_many_w)
+    tk=0
+    while [ "$tk" -le "$ta" ]; do
+	touch $QDIR/q/0.$$$tk.-k
+	tk=$(( $tk + 1 ))
+    done
     exit 0
 }
 
@@ -141,8 +263,12 @@ _work_1() {
         # if nothing is waiting in q, go to sleep, but use inotifywait so you
         # get woken up immediately if a new task lands
         [ -z "$ID" ] && {
-            inotifywait -q -t 60 -e create q >/dev/null
-            continue
+		if [ $(command -v inotifywait) ]; then
+			inotifywait -q -t 60 -e create q >/dev/null
+		else
+			sleep 60
+		fi
+		continue
             # whether we got an event or just timed out, we just go back round
         }
 
@@ -173,17 +299,18 @@ _work_1() {
 # STATUS
 
 # examine the output directory using $BQ_FILEMANAGER (defaulting to vifm)
-[ -z "$1" ] && exec sh -c "${BQ_FILEMANAGER:-vifm} $QDIR"
+[ -z "$1" ] && exec sh -c "${BQ_FILEMANAGER:-mc} $QDIR"
 
 # ----------------------------------------------------------------------
-# some command was given; add it to the queue
 
+# some command was given; add it to the queue
+#ID=`date +%s`.$$.${1//[^a-z0-9_.-]/}
 # check for a task label via `bq -L label cmd ...`
 if [ "$1" == "-L" ]; then
-    [ -z "$3" ] && die "-L needs a task label"
-    LABEL=$2; shift; shift
+	[ -z "$3" ] && die "-L needs a task label"
+	LABEL="$2"; shift; shift
 else
-    LABEL=$1
+	LABEL="$1"
 fi
 
 ID=`date +%s`.$$.${LABEL//[^a-z0-9_.-]/}
